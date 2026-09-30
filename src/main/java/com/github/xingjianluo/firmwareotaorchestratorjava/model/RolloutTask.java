@@ -20,6 +20,15 @@ public class RolloutTask {
     private int deviceFailureThreshold;
     /** 任务整体失败率(0~1)超过该值则中止推进。 */
     private double taskFailureRateThreshold;
+    /** 是否开启并行推进窗口（true=多个批次可同时在途）。 */
+    private boolean parallelWindow;
+    /** 并行窗口容量：同时允许在途（未收敛）的设备数上限。 */
+    private int maxInFlightDevices;
+    /**
+     * 最近一次推进评估后，是否已不存在「当前兼容且未参与」的设备。
+     * 仅并行窗口模式使用：报告路径据此在全部在途收敛且无候选可补时收尾。
+     */
+    private boolean candidateExhausted;
     private TaskStatus status;
     private final Map<Integer, TaskBatch> batches = new LinkedHashMap<>();
     private long createdAt;
@@ -79,6 +88,30 @@ public class RolloutTask {
 
     public void setTaskFailureRateThreshold(double taskFailureRateThreshold) {
         this.taskFailureRateThreshold = taskFailureRateThreshold;
+    }
+
+    public boolean isParallelWindow() {
+        return parallelWindow;
+    }
+
+    public void setParallelWindow(boolean parallelWindow) {
+        this.parallelWindow = parallelWindow;
+    }
+
+    public int getMaxInFlightDevices() {
+        return maxInFlightDevices;
+    }
+
+    public void setMaxInFlightDevices(int maxInFlightDevices) {
+        this.maxInFlightDevices = maxInFlightDevices;
+    }
+
+    public boolean isCandidateExhausted() {
+        return candidateExhausted;
+    }
+
+    public void setCandidateExhausted(boolean candidateExhausted) {
+        this.candidateExhausted = candidateExhausted;
     }
 
     public TaskStatus getStatus() {

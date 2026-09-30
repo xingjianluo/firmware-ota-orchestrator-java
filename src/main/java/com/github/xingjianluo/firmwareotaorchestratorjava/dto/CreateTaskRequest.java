@@ -11,6 +11,11 @@ public class CreateTaskRequest {
     private Integer batchSize;
     private Integer deviceFailureThreshold;
     private Double taskFailureRateThreshold;
+    /**
+     * 同时在途设备数上限（并行推进窗口容量）。
+     * 为空表示沿用严格串行批次模式；显式给出正值时开启并行窗口模式。
+     */
+    private Integer maxInFlightDevices;
 
     public String getTargetVersion() {
         return targetVersion;
@@ -66,5 +71,13 @@ public class CreateTaskRequest {
 
     public void setTaskFailureRateThreshold(Double taskFailureRateThreshold) {
         this.taskFailureRateThreshold = taskFailureRateThreshold;
+    }
+
+    public Integer getMaxInFlightDevices() {
+        return maxInFlightDevices;
+    }
+
+    public void setMaxInFlightDevices(Integer maxInFlightDevices) {
+        this.maxInFlightDevices = maxInFlightDevices;
     }
 }

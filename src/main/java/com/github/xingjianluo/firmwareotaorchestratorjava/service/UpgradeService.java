@@ -134,6 +134,11 @@ public class UpgradeService {
                         RollbackReason.DEVICE_FAILURE_THRESHOLD);
                 checkTaskFailureRate(task);
                 maybeCloseBatch(task, batch);
+                // 并行窗口模式下，回滚收敛同样会释放名额；若已无在途且无候选则任务收尾。
+                // 任务刚被中止时仍为 ABORTED，不会被这里改写成完成；串行模式语义不变。
+                if (task.isParallelWindow()) {
+                    maybeCompleteTask(task);
+                }
                 return response(task, device, record, false);
             }
             // 未达阈值：进入该阶段的“进行中/失败待重试”态，等待设备重试
@@ -228,8 +233,10 @@ public class UpgradeService {
 
     private void maybeCompleteTask(RolloutTask task) {
         if (task.getStatus() != TaskStatus.IN_PROGRESS) {
+            // ABORTED 始终保持中止，不会因在途设备收敛而被改写成完成
             return;
         }
+        // 仍有在途（未收敛）设备时不完成
         for (UpgradeRecord r : store.upgrades().values()) {
             if (r.getTaskId().equals(task.getId())
                     && r.getPhase() != UpgradePhase.ACTIVATED
@@ -237,13 +244,22 @@ public class UpgradeService {
                 return;
             }
         }
-        // 仍有未参与且兼容的设备时不算完成；交给下次 advance 判定
-        boolean hasInFlight = store.upgrades().values().stream()
-                .anyMatch(r -> r.getTaskId().equals(task.getId()));
-        if (hasInFlight) {
-            task.setStatus(TaskStatus.COMPLETED);
-            log.info("任务完成 taskId={}（所有参与设备已收敛）", task.getId());
+        if (task.isParallelWindow()) {
+            // 并行窗口模式：仅当最近一次推进评估确认已无「当前兼容且未参与」的候选时才收尾，
+            // 避免漏掉还在等待条件转好（如离线恢复）的设备；有候选时留给下一次 advance 补人。
+            if (!task.isCandidateExhausted()) {
+                return;
+            }
+        } else {
+            // 串行模式（旧语义）：至少有一个参与设备
+            boolean hasParticipant = store.upgrades().values().stream()
+                    .anyMatch(r -> r.getTaskId().equals(task.getId()));
+            if (!hasParticipant) {
+                return;
+            }
         }
+        task.setStatus(TaskStatus.COMPLETED);
+        log.info("任务完成 taskId={}（所有参与设备已收敛，无待补候选）", task.getId());
     }
 
     /**
