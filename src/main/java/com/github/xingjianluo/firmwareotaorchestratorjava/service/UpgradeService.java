@@ -36,11 +36,14 @@ public class UpgradeService {
 
     private final InMemoryStore store;
     private final DeviceService deviceService;
+    private final CompatibilityService compatibilityService;
     private final java.time.Clock clock;
 
-    public UpgradeService(InMemoryStore store, DeviceService deviceService, java.time.Clock clock) {
+    public UpgradeService(InMemoryStore store, DeviceService deviceService,
+                          CompatibilityService compatibilityService, java.time.Clock clock) {
         this.store = store;
         this.deviceService = deviceService;
+        this.compatibilityService = compatibilityService;
         this.clock = clock;
     }
 
@@ -234,16 +237,21 @@ public class UpgradeService {
             if (r.getTaskId().equals(task.getId())
                     && r.getPhase() != UpgradePhase.ACTIVATED
                     && r.getPhase() != UpgradePhase.ROLLED_BACK) {
+                return; // 仍有在途设备
+            }
+        }
+        // 并行窗口下，所有在途设备刚收敛时可能还没调用 advance 补人；
+        // 只有「不存在未参与且当前仍兼容的设备」时才真正收尾，防止把等待补入的设备漏掉。
+        for (Device device : deviceService.list()) {
+            if (!store.upgrades().containsKey(RolloutService.upgradeKey(task.getId(), device.getId()))
+                    && compatibilityService.evaluate(task, device).isEmpty()) {
+                log.info("任务暂不收尾 taskId={}，仍有可补入设备 deviceId={}",
+                        task.getId(), device.getId());
                 return;
             }
         }
-        // 仍有未参与且兼容的设备时不算完成；交给下次 advance 判定
-        boolean hasInFlight = store.upgrades().values().stream()
-                .anyMatch(r -> r.getTaskId().equals(task.getId()));
-        if (hasInFlight) {
-            task.setStatus(TaskStatus.COMPLETED);
-            log.info("任务完成 taskId={}（所有参与设备已收敛）", task.getId());
-        }
+        task.setStatus(TaskStatus.COMPLETED);
+        log.info("任务完成 taskId={}（在途设备全部收敛且无更多可推进设备）", task.getId());
     }
 
     /**

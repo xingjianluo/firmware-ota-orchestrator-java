@@ -23,14 +23,21 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 灰度任务创建、批次编排与推进。
+ * 灰度任务创建、批次编排与推进（并行窗口模型）。
  *
  * <p>推进规则：每次 {@link #advance(String)} 在任务锁内评估全部设备——</p>
  * <ol>
- *   <li>不兼容/状态不满足 → 写 {@link ExclusionRecord}（每设备仅记录一次，原因明确不静默）；</li>
+ *   <li>不兼容/状态不满足 → 写 {@link ExclusionRecord}（每设备仅记录一次，原因明确不静默）；
+ *       排除不是永久黑名单：设备后续条件变好（上线、版本变动）时可再次成为候选；</li>
  *   <li>已参与（已分配/成功/回滚）的设备不再重复进入批次；</li>
- *   <li>兼容且未参与的设备按注册顺序取 batchSize 台，组成下一批并打开。</li>
+ *   <li>兼容且未参与的设备按注册顺序，在并行窗口的剩余名额
+ *       （maxInFlight - 当前在途数）内尽量铺满；一次推进可同时打开多个不超过
+ *       batchSize 的批次并行推进。</li>
  * </ol>
+ *
+ * <p>在途 = 已分配但尚未收敛（阶段既非 ACTIVATED 也非 ROLLED_BACK）的参与设备。
+ * 设备激活成功或回滚收敛即释放窗口名额；窗口满时 advance 反压拒绝（BATCH_NOT_OPEN）。
+ * 只有「既无在途设备、也无当前仍兼容的未参与设备」时任务才收尾。</p>
  */
 @Service
 public class RolloutService {
@@ -64,6 +71,9 @@ public class RolloutService {
         task.setHardwareWhitelist(request.getHardwareWhitelist());
         task.setBatchSize(request.getBatchSize() == null || request.getBatchSize() <= 0
                 ? 2 : request.getBatchSize());
+        // 未显式配置窗口时，默认容量=批大小：等价于旧的「一批收敛后再开下一批」串行语义
+        task.setMaxInFlight(request.getMaxInFlight() == null || request.getMaxInFlight() <= 0
+                ? task.getBatchSize() : request.getMaxInFlight());
         task.setDeviceFailureThreshold(request.getDeviceFailureThreshold() == null
                 || request.getDeviceFailureThreshold() <= 0 ? 1 : request.getDeviceFailureThreshold());
         task.setTaskFailureRateThreshold(request.getTaskFailureRateThreshold() == null
@@ -71,11 +81,11 @@ public class RolloutService {
         task.setStatus(TaskStatus.CREATED);
         task.setCreatedAt(clock.millis());
         store.tasks().put(id, task);
-        log.info("createTask taskId={} target={} range=[{},{}] models={} batchSize={} devThr={} taskRate={}",
+        log.info("createTask taskId={} target={} range=[{},{}] models={} batchSize={} maxInFlight={} devThr={} taskRate={}",
                 id, task.getTargetVersion(), request.getMinSourceVersion(),
                 request.getMaxSourceVersion(), task.getHardwareWhitelist(),
-                task.getBatchSize(), task.getDeviceFailureThreshold(),
-                task.getTaskFailureRateThreshold());
+                task.getBatchSize(), task.getMaxInFlight(),
+                task.getDeviceFailureThreshold(), task.getTaskFailureRateThreshold());
         return task;
     }
 
@@ -92,18 +102,19 @@ public class RolloutService {
             }
             // 先把已收敛的打开批次关闭（上报路径也会触发，这里保证推进口径幂等）
             closeSettledBatches(task);
-            // 仍有打开中的批次时不允许再开新批：必须等当前批次收敛
-            for (TaskBatch b : task.getBatches().values()) {
-                if (b.isOpen() && !b.isClosed()) {
-                    throw new RejectedException(RejectReason.BATCH_NOT_OPEN,
-                            "批次 " + b.getIndex() + " 尚未收敛（成功/失败未全部上报），暂不能推进下一批");
-                }
-            }
-            if (task.getStatus() == TaskStatus.CREATED) {
-                task.setStatus(TaskStatus.IN_PROGRESS);
+
+            // 并行窗口：在途 = 已分配但尚未收敛（非 ACTIVATED/ROLLED_BACK）的参与设备
+            int inFlight = countInFlight(task);
+            int capacity = task.getMaxInFlight() - inFlight;
+            if (capacity <= 0) {
+                // 窗口已满：本次不补人，等设备收敛腾位置后下一次推进再补
+                throw new RejectedException(RejectReason.BATCH_NOT_OPEN,
+                        "并行窗口已满（在途 " + inFlight + "/" + task.getMaxInFlight()
+                                + "），等待在途设备激活成功或回滚收敛后再推进");
             }
 
-            // 先全量评估：不兼容设备必须逐一留痕，绝不因批次选满而静默跳过
+            // 全量评估：不兼容设备必须逐一留痕，绝不因窗口选满而静默跳过。
+            // 注意：排除不留永久黑名单——设备本次条件变好（上线/版本变动）即可重新成为候选。
             List<Device> candidates = new ArrayList<>();
             for (Device device : deviceService.list()) {
                 if (store.upgrades().containsKey(upgradeKey(taskId, device.getId()))) {
@@ -118,37 +129,64 @@ public class RolloutService {
                 }
                 candidates.add(device);
             }
-            // 再按注册顺序截取本批
-            List<Device> selected = candidates.size() > task.getBatchSize()
-                    ? new ArrayList<>(candidates.subList(0, task.getBatchSize()))
-                    : candidates;
 
-            if (selected.isEmpty()) {
-                log.info("advance 无可推进设备 taskId={}，检查是否收敛完成", taskId);
-                if (allParticipantsSettled(task)) {
+            if (candidates.isEmpty()) {
+                log.info("advance 暂无可推进设备 taskId={} inFlight={}", taskId, inFlight);
+                if (inFlight == 0) {
+                    // 既没有可推进设备，也没有在途设备 → 任务收尾
                     task.setStatus(TaskStatus.COMPLETED);
                     log.info("advance 任务自然完成 taskId={}", taskId);
                 }
                 return null;
             }
 
-            int index = task.getBatches().size();
-            TaskBatch batch = new TaskBatch(index);
-            batch.setOpen(true);
-            long now = clock.millis();
-            for (Device d : selected) {
-                batch.getDeviceIds().add(d.getId());
-                UpgradeRecord record = new UpgradeRecord(taskId, d.getId());
-                record.setBatchIndex(index);
-                record.setPhase(UpgradePhase.ASSIGNED);
-                record.setUpdatedAt(now);
-                store.upgrades().put(upgradeKey(taskId, d.getId()), record);
+            if (task.getStatus() == TaskStatus.CREATED) {
+                task.setStatus(TaskStatus.IN_PROGRESS);
             }
-            task.getBatches().put(index, batch);
-            log.info("advance 打开批次 taskId={} batch={} devices={}",
-                    taskId, index, batch.getDeviceIds());
-            return batch;
+
+            // 按注册顺序，只用空出的窗口名额，把窗口尽量铺满
+            List<Device> selected = candidates.size() > capacity
+                    ? new ArrayList<>(candidates.subList(0, capacity)) : candidates;
+
+            // 一次推进可同时打开多个批次（每批仍不超过 batchSize），多批并行推进
+            long now = clock.millis();
+            TaskBatch firstOpened = null;
+            for (int from = 0; from < selected.size(); from += task.getBatchSize()) {
+                int to = Math.min(from + task.getBatchSize(), selected.size());
+                int index = task.getBatches().size();
+                TaskBatch batch = new TaskBatch(index);
+                batch.setOpen(true);
+                for (Device d : selected.subList(from, to)) {
+                    batch.getDeviceIds().add(d.getId());
+                    UpgradeRecord record = new UpgradeRecord(taskId, d.getId());
+                    record.setBatchIndex(index);
+                    record.setPhase(UpgradePhase.ASSIGNED);
+                    record.setUpdatedAt(now);
+                    store.upgrades().put(upgradeKey(taskId, d.getId()), record);
+                }
+                task.getBatches().put(index, batch);
+                if (firstOpened == null) {
+                    firstOpened = batch;
+                }
+                log.info("advance 打开批次 taskId={} batch={} devices={} 窗口占用={}/{}",
+                        taskId, index, batch.getDeviceIds(),
+                        countInFlight(task), task.getMaxInFlight());
+            }
+            return firstOpened;
         }
+    }
+
+    /** 统计任务下仍在途（未收敛）的设备数：阶段既非激活成功也非已回滚。调用方需持 task 锁。 */
+    int countInFlight(RolloutTask task) {
+        int inFlight = 0;
+        for (UpgradeRecord r : store.upgrades().values()) {
+            if (r.getTaskId().equals(task.getId())
+                    && r.getPhase() != UpgradePhase.ACTIVATED
+                    && r.getPhase() != UpgradePhase.ROLLED_BACK) {
+                inFlight++;
+            }
+        }
+        return inFlight;
     }
 
     /** 关闭其中所有设备均已收敛（激活成功或已回滚）的打开批次。调用方需持 task 锁。 */
@@ -172,19 +210,6 @@ public class RolloutService {
                         task.getId(), batch.getIndex(), batch.getSuccessCount(), batch.getFailedCount());
             }
         }
-    }
-
-    private boolean allParticipantsSettled(RolloutTask task) {        boolean hasParticipant = false;
-        for (UpgradeRecord r : store.upgrades().values()) {
-            if (!r.getTaskId().equals(task.getId())) {
-                continue;
-            }
-            hasParticipant = true;
-            if (r.getPhase() != UpgradePhase.ACTIVATED && r.getPhase() != UpgradePhase.ROLLED_BACK) {
-                return false;
-            }
-        }
-        return hasParticipant;
     }
 
     private boolean alreadyExcluded(String taskId, String deviceId) {
@@ -231,14 +256,20 @@ public class RolloutService {
                 }
             }
             double failureRate = total == 0 ? 0 : (double) failed / total;
+            int inFlightNow = total - success - failed;
             Map<String, Object> view = new LinkedHashMap<>();
             view.put("taskId", taskId);
             view.put("status", task.getStatus());
             view.put("targetVersion", task.getTargetVersion());
+            view.put("batchSize", task.getBatchSize());
+            view.put("maxInFlight", task.getMaxInFlight());
             view.put("participants", total);
             view.put("success", success);
             view.put("rolledBack", failed);
             view.put("inProgress", inProgress);
+            // 并行窗口：当前在途设备数与剩余可补名额
+            view.put("inFlight", inFlightNow);
+            view.put("windowRemaining", Math.max(0, task.getMaxInFlight() - inFlightNow));
             view.put("failureRate", failureRate);
             view.put("abortReason", task.getAbortReason());
             view.put("batches", batchViews);

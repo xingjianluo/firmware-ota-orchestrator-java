@@ -9,6 +9,8 @@ public class CreateTaskRequest {
     private String maxSourceVersion;
     private List<String> hardwareWhitelist;
     private Integer batchSize;
+    /** 同时在途设备数上限（并行推进窗口容量）。 */
+    private Integer maxInFlight;
     private Integer deviceFailureThreshold;
     private Double taskFailureRateThreshold;
 
@@ -50,6 +52,14 @@ public class CreateTaskRequest {
 
     public void setBatchSize(Integer batchSize) {
         this.batchSize = batchSize;
+    }
+
+    public Integer getMaxInFlight() {
+        return maxInFlight;
+    }
+
+    public void setMaxInFlight(Integer maxInFlight) {
+        this.maxInFlight = maxInFlight;
     }
 
     public Integer getDeviceFailureThreshold() {

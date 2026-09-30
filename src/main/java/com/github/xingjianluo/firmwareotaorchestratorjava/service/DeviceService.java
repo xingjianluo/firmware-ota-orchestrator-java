@@ -28,6 +28,9 @@ public class DeviceService {
 
     private final InMemoryStore store;
     private final java.time.Clock clock;
+    /** 注册序号发生器：即使同一毫秒内批量注册，推进顺序也严格按注册先后。 */
+    private final java.util.concurrent.atomic.AtomicLong registrationSeq =
+            new java.util.concurrent.atomic.AtomicLong();
 
     public DeviceService(InMemoryStore store, java.time.Clock clock) {
         this.store = store;
@@ -51,6 +54,7 @@ public class DeviceService {
         created.setCurrentVersion(firmwareVersion);
         created.setStableVersion(firmwareVersion);
         created.setStatus(DeviceStatus.ONLINE);
+        created.setRegistrationSeq(registrationSeq.getAndIncrement());
         created.setRegisteredAt(now);
         created.setLastHeartbeatAt(now);
         created.setHeartbeatCount(1L);
@@ -145,6 +149,8 @@ public class DeviceService {
     }
 
     public List<Device> list() {
-        return new ArrayList<>(store.devices().values());
+        List<Device> devices = new ArrayList<>(store.devices().values());
+        devices.sort(java.util.Comparator.comparingLong(Device::getRegistrationSeq));
+        return devices;
     }
 }

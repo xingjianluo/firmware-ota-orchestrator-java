@@ -71,7 +71,7 @@ class UpgradeServiceTest {
         store = new InMemoryStore();
         deviceService = new DeviceService(store, clock);
         rolloutService = new RolloutService(store, deviceService, new CompatibilityService(), clock);
-        upgradeService = new UpgradeService(store, deviceService, clock);
+        upgradeService = new UpgradeService(store, deviceService, new CompatibilityService(), clock);
     }
 
     private RolloutTask createTask(int batchSize, int deviceFailureThreshold, double taskRate) {

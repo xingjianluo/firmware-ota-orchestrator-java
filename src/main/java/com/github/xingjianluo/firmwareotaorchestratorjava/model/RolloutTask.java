@@ -16,6 +16,8 @@ public class RolloutTask {
     /** 允许参与的硬件型号，空表示不限。 */
     private java.util.List<String> hardwareWhitelist;
     private int batchSize;
+    /** 并行推进窗口容量：同时允许处于在途（未收敛）状态的设备数上限。 */
+    private int maxInFlight;
     /** 单台设备连续失败次数达到该值即触发该设备回滚。 */
     private int deviceFailureThreshold;
     /** 任务整体失败率(0~1)超过该值则中止推进。 */
@@ -63,6 +65,14 @@ public class RolloutTask {
 
     public void setBatchSize(int batchSize) {
         this.batchSize = batchSize;
+    }
+
+    public int getMaxInFlight() {
+        return maxInFlight;
+    }
+
+    public void setMaxInFlight(int maxInFlight) {
+        this.maxInFlight = maxInFlight;
     }
 
     public int getDeviceFailureThreshold() {

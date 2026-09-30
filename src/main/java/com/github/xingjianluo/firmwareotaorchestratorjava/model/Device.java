@@ -8,6 +8,8 @@ import com.github.xingjianluo.firmwareotaorchestratorjava.state.DeviceStatus;
 public class Device {
 
     private final String id;
+    /** 注册先后序号，从 0 单调递增，作为推进选设备的稳定排序键。 */
+    private long registrationSeq;
     private String hardwareModel;
     private String currentVersion;
     /** 升级开始前的稳定版本，回滚目标。 */
@@ -23,6 +25,14 @@ public class Device {
 
     public String getId() {
         return id;
+    }
+
+    public long getRegistrationSeq() {
+        return registrationSeq;
+    }
+
+    public void setRegistrationSeq(long registrationSeq) {
+        this.registrationSeq = registrationSeq;
     }
 
     public String getHardwareModel() {
