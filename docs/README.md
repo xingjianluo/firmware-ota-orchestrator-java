@@ -30,19 +30,42 @@
 ### 任务级：`TaskStatus`
 
 ```
-CREATED --首次 advance--> IN_PROGRESS --在途全部收敛且无更多可推进设备--> COMPLETED
-                          IN_PROGRESS --整体回滚率超阈值--> ABORTED
+CREATED --首次 advance--> IN_PROGRESS --在途全部收敛（成功或回滚）且无更多可推进设备--> COMPLETED
+                          IN_PROGRESS --整体回滚率严格超阈值--> ABORTED
 ```
 
+- **收尾覆盖回滚收敛**：最后在途的设备无论是激活成功还是失败回滚，只要在途归零、
+  且窗外没有仍兼容的未参与设备，就自动收尾为 `COMPLETED`（失败率未超阈值、任务
+  未中止时，「一台成功 + 一台回滚」同样收尾），不会卡在 `IN_PROGRESS` 像卡死。
 - ABORTED 后**不再往窗口补新设备**（`advance` 返回 409 `TASK_NOT_IN_PROGRESS`），
-  但**已经在途的设备上报仍正常受理**，可以把这次升级跑完；任务停在 ABORTED，
-  直到在途全部收敛（不会因为在途成功而翻回 COMPLETED）。
-- 批次不再「一批卡住全盘等待」：多个批次可以同时打开、并行推进，由
-  **并行推进窗口（容量 `maxInFlight`）** 约束全局同时在途的设备数。
+  但**已经在途的设备上报仍正常受理**，可以把这次升级跑完或回滚；任务**始终停在
+  ABORTED**——即使在途随后全部收敛（含成功），也绝不会被翻回 `COMPLETED`。
+- 推进节奏分两种（由创建任务时是否配置 `maxInFlight` 决定）：
+  - **不配置（默认）= 严格串行分批**：必须等当前这批设备**整批收敛**（全部成功
+    或回滚）后才能开下一批；批次内哪怕只有一台先收敛，也不会提前补人。
+  - **显式配置 `maxInFlight` = 并行推进窗口**：设备收敛即释放名额、立即滑动补人，
+    多个批次可同时打开，由容量上限约束全局在途数。
 
-## 2.1 并行推进窗口（`maxInFlight`）
+## 2.1 推进节奏与并行推进窗口（`maxInFlight`）
 
-创建任务时可配置「同时在途设备数」上限 `maxInFlight`（与 `batchSize` 并列）：
+创建任务时可配置「同时在途设备数」上限 `maxInFlight`（与 `batchSize` 并列）。
+
+### 不配置时默认怎么走（向后兼容）
+
+`maxInFlight` 不传或 ≤0 时，**默认是旧版严格串行分批语义**（进度中
+`parallelWindowEnabled=false`）：
+
+- 每次推进最多开**一个**批次（至多 `batchSize` 台）；
+- 当前批次里只要还有一台设备未收敛（没到 `ACTIVATED` 也没到 `ROLLED_BACK`），
+  再调 `advance` 一律返回 409 `BATCH_NOT_OPEN`，**不会因为批次里某台先成功/回滚
+  就把新设备补进来**；
+- 必须等这一批**整批收敛**（批次关闭）后，下一次 `advance` 才开下一批；
+- 此模式下批次未整批收敛时进度里的 `windowRemaining` 恒为 0（明确表示现在不放人），
+  整批收敛后才恢复为 `batchSize`。
+
+只有**显式传入** `maxInFlight > 0` 时才启用并行窗口（`parallelWindowEnabled=true`）。
+
+### 并行窗口语义（显式配置时）
 
 - **容量怎么算**：`剩余名额 = maxInFlight - 当前在途数`。
   「在途」= 已分配但尚未收敛的参与设备，即升级阶段既不是 `ACTIVATED` 也不是
@@ -53,21 +76,26 @@ CREATED --首次 advance--> IN_PROGRESS --在途全部收敛且无更多可推�
 - **窗口满了**：`advance` 不补人，返回 409 `BATCH_NOT_OPEN`（消息里带
   `在途 x/maxInFlight`），等有设备收敛腾位置后，下一次 `advance` 再补。
 - **什么时候释放名额**：设备**激活成功（ACTIVATED）**或**回滚收敛
-  （ROLLED_BACK）**的瞬间即释放它占用的窗口名额，后续推进优先把名额分给
-  还没参与过、且仍符合条件的设备。
+  （ROLLED_BACK）**的瞬间即释放它占用的窗口名额，后续推进按**设备注册先后**
+  优先把名额分给还没参与过、且仍符合条件的设备；窗口满了就不补人，已参与设备
+  绝不重复入批。
 - **不漏 / 不重 / 不被批次边界卡住**：是否参与以升级记录
   （`taskId:deviceId`）为准，已参与设备绝不二次入批；窗口与批次边界都不会
   漏掉设备。任务只有在**既没有在途设备、也没有当前仍兼容的未参与设备**时
   才收尾（`COMPLETED`）。
 - **被排除过的设备可重新进入**：排除记录只在「当前确实不兼容」时写一条，
   不是永久黑名单；设备重新上线或版本变好后，后续 `advance` 会重新接纳它。
-- **默认值与向后兼容**：`maxInFlight` 不传或 ≤0 时取 `batchSize`，此时窗口
-  一次只放一批，语义与旧版「一批收敛后再开下一批」的串行推进完全一致。
+- **任务中止后的表现**：失败率严格超阈值后任务置 `ABORTED` 且立即停止补新设备；
+  已在途设备的上报照常受理、可成功可回滚，名额随它们收敛逐一释放
+  （`inFlight` 下降、`windowRemaining` 回升），但任务状态永不翻回 `COMPLETED`；
+  只有「无可推进设备 + 在途归零」时才算彻底静止（中止任务停在 ABORTED，
+  正常任务收尾为 COMPLETED）。
 - 并发安全：`advance` 与结果上报都在**任务锁**内更新窗口占用，锁顺序固定
   task → upgradeRecord → device，并发推进/上报下在途数不会超过上限，
   设备也不会被重复放进批次。
 - 批次内所有设备都到 `ACTIVATED` 或 `ROLLED_BACK` 后该批次自动关闭
-  （`closed=true`，仅作进度展示）；批次关闭不再阻塞其他批次并行推进。
+  （`closed=true`，仅作进度展示）。并行窗口下班次关闭不阻塞其他批次；
+  默认串行模式下班次关闭则是开下一批的前提。
 
 ### 设备升级阶段：`UpgradePhase`
 
@@ -150,18 +178,37 @@ ASSIGNED
 | GET `/api/devices/{id}` / GET `/api/devices` | 设备详情 / 列表（列表按注册先后排序） |
 | POST `/api/tasks` | 创建任务 `{targetVersion, minSourceVersion, maxSourceVersion, hardwareWhitelist?, batchSize?, maxInFlight?, deviceFailureThreshold?, taskFailureRateThreshold?}` |
 | POST `/api/tasks/{id}/advance` | 评估设备并按窗口剩余名额补人（可同时打开多个批次）；窗口满返回 409 `BATCH_NOT_OPEN` |
-| GET `/api/tasks/{id}/progress` | 任务进度：`maxInFlight`、`inFlight`（当前在途）、`windowRemaining`（窗口剩余名额）、`participants/success/rolledBack/inProgress`、`failureRate`、各批次视图、排除数 |
+| GET `/api/tasks/{id}/progress` | 任务进度：`parallelWindowEnabled`（是否并行窗口模式）、`maxInFlight`、`inFlight`（当前在途）、`windowRemaining`（剩余可补名额；默认串行模式下本批未收敛恒为 0）、`participants/success/rolledBack/inProgress`、`failureRate`、各批次视图、排除数 |
 | GET `/api/tasks/{id}/exclusions` | 排除明细（不静默跳过的留痕） |
 | POST `/api/tasks/reports` | 升级结果上报 |
 
-`progress` 中窗口字段示例：`"maxInFlight": 4, "inFlight": 3, "windowRemaining": 1`。
+`progress` 中窗口字段示例：`"parallelWindowEnabled": true, "maxInFlight": 4, "inFlight": 3, "windowRemaining": 1`。
+默认串行模式（未配置 `maxInFlight`）下示例：`"parallelWindowEnabled": false,
+"maxInFlight": 2, "inFlight": 1, "windowRemaining": 0`（本批还有一台在途，不放人）。
 
 ## 6. 本地验证
 
 ```bash
-mvn -o test            # 离线运行全部 26 个单测/集成测试（联网可去掉 -o）
+mvn -o test            # 离线运行全部 29 个单测/集成测试（联网可去掉 -o）
 mvn -o spring-boot:run # 启动后用 curl 按上面接口走流程
 ```
+
+只跑本次修复相关的收敛回归：
+
+```bash
+mvn -o test -Dtest=RolloutConvergenceTest
+```
+
+手工验证**默认串行节奏**（不传 `maxInFlight`，`batchSize=2`，注册 4 台设备）：
+首次 `advance` 只进 d1/d2；把 d1 单独报成功链路后再 `advance`，返回 409
+`BATCH_NOT_OPEN` 且进度 `inFlight=1/windowRemaining=0/participants=2`，d3/d4
+不进批；d2 也收敛后再 `advance` 才打开 d3/d4 的新批次。
+
+手工验证**回滚收敛自动收尾**（2 台设备、设备阈值 1、任务失败率阈值 0.5）：
+d1 走完整成功链路、d2 上报一次 `DOWNLOAD_FAILED` 触发回滚；此时失败率 0.5
+（未**严格**超过阈值），任务在 d2 回滚的当次上报即自动变为 `COMPLETED`，
+`inFlight=0`。若想验证中止不翻转：把阈值调到 0.34、3 台在途中 2 台回滚触发
+`ABORTED` 后，剩余一台照常报成功，任务始终停在 `ABORTED`。
 
 手工体验并行窗口（`maxInFlight=4, batchSize=2`）：注册 6 台 `Box-A/1.0.0` 设备后，
 一次 `advance` 即同时打开 3 个批次铺满 4 个名额（d1~d4 在途，d5/d6 等待）；
@@ -181,7 +228,13 @@ d5/d6 即按注册顺序补入；`progress` 全程可观察 `inFlight/windowRema
   顺序继续补人且不重不漏、③4 推进线程 + 2 上报线程并发下在途永不超上限/设备不
   重复入批、④失败率超阈值中止后窗口不再补充但在途设备能跑完并正常收尾、
   ⑤曾被排除的设备条件变好后可重新进入**；
+- `RolloutConvergenceTest`（3，本次修复）：**业务一①不配置 `maxInFlight` 时批次内
+  仅一台先收敛不得放行下一批（`windowRemaining=0`、不补 d3/d4），整批收敛后才开
+  新批；业务二②一台成功一台回滚、失败率未严格超阈值时在最后一台回滚上报当次
+  自动收尾到 `COMPLETED`（在途归零）；业务三③失败率超阈值中止后不再补新设备、
+  在途设备仍能跑完/回滚且名额全部释放，任务状态始终停在 `ABORTED` 不被翻回完成**；
 - `ApplicationTests`（1）：MockMvc 端到端 HTTP 全链路与拒绝码校验。
 
 所有单测日志均打印**输入**（并发数/上报类型/版本条件）与**判定依据/结果**
-（阶段、计数、原因码、回滚版本），便于复盘。
+（阶段、计数、原因码、回滚版本、在途/剩余名额、任务状态），便于复盘；
+`RolloutConvergenceTest` 用「业务一/二/三」前缀标注每个用例覆盖的修复点。

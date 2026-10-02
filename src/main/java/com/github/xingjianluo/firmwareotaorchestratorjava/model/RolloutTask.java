@@ -18,6 +18,13 @@ public class RolloutTask {
     private int batchSize;
     /** 并行推进窗口容量：同时允许处于在途（未收敛）状态的设备数上限。 */
     private int maxInFlight;
+    /**
+     * 是否启用并行窗口（滑动名额）语义。
+     * <p>true：设备收敛即释放名额、立即补新设备，多个批次可同时打开；
+     * false（默认，创建时未显式配置 maxInFlight）：必须等当前打开的批次
+     * 全部整批收敛后才能开下一批，即旧版严格串行分批语义。</p>
+     */
+    private boolean parallelWindowEnabled;
     /** 单台设备连续失败次数达到该值即触发该设备回滚。 */
     private int deviceFailureThreshold;
     /** 任务整体失败率(0~1)超过该值则中止推进。 */
@@ -73,6 +80,14 @@ public class RolloutTask {
 
     public void setMaxInFlight(int maxInFlight) {
         this.maxInFlight = maxInFlight;
+    }
+
+    public boolean isParallelWindowEnabled() {
+        return parallelWindowEnabled;
+    }
+
+    public void setParallelWindowEnabled(boolean parallelWindowEnabled) {
+        this.parallelWindowEnabled = parallelWindowEnabled;
     }
 
     public int getDeviceFailureThreshold() {

@@ -137,6 +137,10 @@ public class UpgradeService {
                         RollbackReason.DEVICE_FAILURE_THRESHOLD);
                 checkTaskFailureRate(task);
                 maybeCloseBatch(task, batch);
+                // 靠回滚收敛也要参与收尾判定：在途归零且无更多可推进设备时自动完成。
+                // 放在 checkTaskFailureRate 之后：若失败率超阈值任务已 ABORTED，
+                // maybeCompleteTask 只接受 IN_PROGRESS，绝不会把中止翻回完成。
+                maybeCompleteTask(task);
                 return response(task, device, record, false);
             }
             // 未达阈值：进入该阶段的“进行中/失败待重试”态，等待设备重试
