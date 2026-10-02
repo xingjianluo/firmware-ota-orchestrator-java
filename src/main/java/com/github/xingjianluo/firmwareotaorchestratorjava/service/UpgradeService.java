@@ -137,6 +137,9 @@ public class UpgradeService {
                         RollbackReason.DEVICE_FAILURE_THRESHOLD);
                 checkTaskFailureRate(task);
                 maybeCloseBatch(task, batch);
+                // 回滚收敛同样释放窗口名额：若这是在途的最后一台且失败率未超阈值
+                // （任务未被中止），任务应在此收尾，而不是停在「进行中」
+                maybeCompleteTask(task);
                 return response(task, device, record, false);
             }
             // 未达阈值：进入该阶段的“进行中/失败待重试”态，等待设备重试
@@ -229,6 +232,12 @@ public class UpgradeService {
                 task.getId(), batch.getIndex(), batch.getSuccessCount(), batch.getFailedCount());
     }
 
+    /**
+     * 在途全部收敛且无更多可推进设备时收尾为 COMPLETED。
+     *
+     * <p>激活成功与回滚收敛两条路径都会调用；仅当任务仍处于 IN_PROGRESS 才收尾，
+     * 已中止（ABORTED）的任务绝不被翻回完成。</p>
+     */
     private void maybeCompleteTask(RolloutTask task) {
         if (task.getStatus() != TaskStatus.IN_PROGRESS) {
             return;

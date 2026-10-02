@@ -357,6 +357,97 @@ class ParallelWindowTest {
     }
 
     @Test
+    void defaultWindow_unsetMaxInFlight_waitsForWholeBatchSettledBeforeNextBatch() {
+        registerDevices(4);
+        // 不配置 maxInFlight：默认语义 = 整批收敛后才放行下一批（旧串行行为）
+        RolloutTask task = createTask(2, null, 1, 0.5);
+
+        TaskBatch b0 = rolloutService.advance(task.getId());
+        assertEquals(Set.of("d1", "d2"), b0.getDeviceIds());
+        assertEquals(1, task.getBatches().size(), "默认窗口一次只放一批");
+        log.info("默认窗口首批: batch0={} maxInFlight={}(默认=batchSize)",
+                b0.getDeviceIds(), task.getMaxInFlight());
+
+        // 只收敛 d1 一台：不得放行下一批，d3 绝不能被补进新批次
+        driveActivated(task.getId(), "d1");
+        Map<String, Object> p1 = rolloutService.progress(task.getId());
+        log.info("仅 d1 收敛后: inFlight={} windowRemaining={} participants={}",
+                p1.get("inFlight"), p1.get("windowRemaining"), p1.get("participants"));
+        assertEquals(1, p1.get("inFlight"));
+        assertEquals(0, p1.get("windowRemaining"), "默认语义下批未整批收敛，剩余名额必须为 0");
+        RejectedException ex = assertThrows(RejectedException.class,
+                () -> rolloutService.advance(task.getId()));
+        assertEquals(RejectReason.BATCH_NOT_OPEN, ex.getReason());
+        assertEquals(1, task.getBatches().size(), "只收敛一台就开新批 = 悄悄改掉旧分批节奏");
+        assertNull(record(task.getId(), "d3"));
+        assertEquals(2, rolloutService.progress(task.getId()).get("participants"));
+
+        // 整批收敛（d2 也激活）后才放行：d3/d4 组成第二批
+        driveActivated(task.getId(), "d2");
+        TaskBatch b1 = rolloutService.advance(task.getId());
+        log.info("整批收敛后放行: batch1={}", b1.getDeviceIds());
+        assertEquals(1, b1.getIndex());
+        assertEquals(Set.of("d3", "d4"), b1.getDeviceIds());
+    }
+
+    @Test
+    void lastInFlightSettlesByRollback_taskAutoCompletes_whenFailureRateWithinThreshold() {
+        registerDevices(2);
+        // 失败率阈值 0.5：1 成功 + 1 回滚 => 率 0.5，未严格超过，不中止
+        RolloutTask task = createTask(2, null, 1, 0.5);
+        rolloutService.advance(task.getId());
+        assertEquals(Set.of("d1", "d2"), task.getBatches().get(0).getDeviceIds());
+
+        // d1 激活成功收敛
+        driveActivated(task.getId(), "d1");
+        assertEquals(TaskStatus.IN_PROGRESS, task.getStatus());
+        assertEquals(1, rolloutService.progress(task.getId()).get("inFlight"));
+
+        // d2 失败回滚收敛：这是在途的最后一台，任务应立即自动收尾而不是卡在「进行中」
+        upgradeService.report(report("d2", task.getId(), ReportType.DOWNLOAD_STARTED));
+        upgradeService.report(report("d2", task.getId(), ReportType.DOWNLOAD_FAILED));
+        Map<String, Object> p = rolloutService.progress(task.getId());
+        log.info("d2 回滚收敛后: status={} success={} rolledBack={} inFlight={} failureRate={}",
+                p.get("status"), p.get("success"), p.get("rolledBack"),
+                p.get("inFlight"), p.get("failureRate"));
+        assertEquals(UpgradePhase.ROLLED_BACK, record(task.getId(), "d2").getPhase());
+        assertEquals(0, p.get("inFlight"));
+        assertEquals(TaskStatus.COMPLETED, task.getStatus(),
+                "在途靠回滚收敛归零且失败率未超阈值时，任务必须自动收尾");
+        assertEquals(1, p.get("success"));
+        assertEquals(1, p.get("rolledBack"));
+    }
+
+    @Test
+    void abortedTask_lastInFlightSettlesByRollback_statusStaysAborted() {
+        registerDevices(4);
+        // batchSize=1, maxInFlight=2, 失败率阈值 0.2：第一台回滚即中止
+        RolloutTask task = createTask(1, 2, 1, 0.2);
+        rolloutService.advance(task.getId());
+        assertEquals(2, task.getBatches().size());
+        assertEquals(2, rolloutService.progress(task.getId()).get("inFlight"));
+
+        // d1 回滚：率 1/2 = 0.5 > 0.2，任务中止；d2 仍在途
+        upgradeService.report(report("d1", task.getId(), ReportType.DOWNLOAD_STARTED));
+        upgradeService.report(report("d1", task.getId(), ReportType.DOWNLOAD_FAILED));
+        assertEquals(TaskStatus.ABORTED, task.getStatus());
+        log.info("d1 回滚触发中止: status={} reason={}", task.getStatus(), task.getAbortReason());
+
+        // 中止后在途的 d2 以回滚方式收敛：状态绝不被翻回 COMPLETED
+        upgradeService.report(report("d2", task.getId(), ReportType.DOWNLOAD_STARTED));
+        upgradeService.report(report("d2", task.getId(), ReportType.DOWNLOAD_FAILED));
+        Map<String, Object> p = rolloutService.progress(task.getId());
+        log.info("在途 d2 回滚收敛后: status={} rolledBack={} inFlight={} windowRemaining={}",
+                p.get("status"), p.get("rolledBack"), p.get("inFlight"), p.get("windowRemaining"));
+        assertEquals(UpgradePhase.ROLLED_BACK, record(task.getId(), "d2").getPhase());
+        assertEquals(0, p.get("inFlight"), "在途全部收敛，窗口占用归零");
+        assertEquals(2, p.get("rolledBack"));
+        assertEquals(TaskStatus.ABORTED, task.getStatus(), "已中止任务不得被翻回完成");
+        assertNull(record(task.getId(), "d3"), "中止后窗外设备始终未被补入");
+        assertNull(record(task.getId(), "d4"));
+    }
+
+    @Test
     void excludedDevice_whenConditionsImprove_getsPickedInLaterAdvance() {
         registerDevices(4);
         // 先把 d2 置离线：首次推进时它被排除留痕；d1 入批占住窗口

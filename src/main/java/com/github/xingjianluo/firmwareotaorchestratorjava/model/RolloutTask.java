@@ -18,6 +18,12 @@ public class RolloutTask {
     private int batchSize;
     /** 并行推进窗口容量：同时允许处于在途（未收敛）状态的设备数上限。 */
     private int maxInFlight;
+    /**
+     * 创建任务时是否显式配置了 maxInFlight。
+     * 未配置时走默认语义：整批收敛（在途归零）后才放行下一批，与旧串行行为一致；
+     * 配置后按窗口剩余名额随收敛随补。
+     */
+    private boolean maxInFlightConfigured;
     /** 单台设备连续失败次数达到该值即触发该设备回滚。 */
     private int deviceFailureThreshold;
     /** 任务整体失败率(0~1)超过该值则中止推进。 */
@@ -73,6 +79,14 @@ public class RolloutTask {
 
     public void setMaxInFlight(int maxInFlight) {
         this.maxInFlight = maxInFlight;
+    }
+
+    public boolean isMaxInFlightConfigured() {
+        return maxInFlightConfigured;
+    }
+
+    public void setMaxInFlightConfigured(boolean maxInFlightConfigured) {
+        this.maxInFlightConfigured = maxInFlightConfigured;
     }
 
     public int getDeviceFailureThreshold() {

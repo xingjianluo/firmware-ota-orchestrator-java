@@ -32,7 +32,9 @@ import java.util.Map;
  *   <li>已参与（已分配/成功/回滚）的设备不再重复进入批次；</li>
  *   <li>兼容且未参与的设备按注册顺序，在并行窗口的剩余名额
  *       （maxInFlight - 当前在途数）内尽量铺满；一次推进可同时打开多个不超过
- *       batchSize 的批次并行推进。</li>
+ *       batchSize 的批次并行推进；</li>
+ *   <li>未显式配置 maxInFlight 时走默认语义：容量取 batchSize，且必须整批收敛
+ *       （在途归零）后才放行下一批，与旧版串行分批推进完全一致。</li>
  * </ol>
  *
  * <p>在途 = 已分配但尚未收敛（阶段既非 ACTIVATED 也非 ROLLED_BACK）的参与设备。
@@ -71,9 +73,11 @@ public class RolloutService {
         task.setHardwareWhitelist(request.getHardwareWhitelist());
         task.setBatchSize(request.getBatchSize() == null || request.getBatchSize() <= 0
                 ? 2 : request.getBatchSize());
-        // 未显式配置窗口时，默认容量=批大小：等价于旧的「一批收敛后再开下一批」串行语义
-        task.setMaxInFlight(request.getMaxInFlight() == null || request.getMaxInFlight() <= 0
-                ? task.getBatchSize() : request.getMaxInFlight());
+        // 未显式配置窗口时，默认容量=批大小，且必须整批收敛（在途归零）后才放行下一批：
+        // 语义与旧版「一批收敛后再开下一批」的串行推进完全一致
+        boolean configured = request.getMaxInFlight() != null && request.getMaxInFlight() > 0;
+        task.setMaxInFlightConfigured(configured);
+        task.setMaxInFlight(configured ? request.getMaxInFlight() : task.getBatchSize());
         task.setDeviceFailureThreshold(request.getDeviceFailureThreshold() == null
                 || request.getDeviceFailureThreshold() <= 0 ? 1 : request.getDeviceFailureThreshold());
         task.setTaskFailureRateThreshold(request.getTaskFailureRateThreshold() == null
@@ -105,9 +109,10 @@ public class RolloutService {
 
             // 并行窗口：在途 = 已分配但尚未收敛（非 ACTIVATED/ROLLED_BACK）的参与设备
             int inFlight = countInFlight(task);
-            int capacity = task.getMaxInFlight() - inFlight;
+            int capacity = windowRemaining(task, inFlight);
             if (capacity <= 0) {
-                // 窗口已满：本次不补人，等设备收敛腾位置后下一次推进再补
+                // 窗口已满（或未配置窗口时本批尚未整批收敛）：本次不补人，
+                // 等设备收敛腾位置后下一次推进再补
                 throw new RejectedException(RejectReason.BATCH_NOT_OPEN,
                         "并行窗口已满（在途 " + inFlight + "/" + task.getMaxInFlight()
                                 + "），等待在途设备激活成功或回滚收敛后再推进");
@@ -189,6 +194,20 @@ public class RolloutService {
         return inFlight;
     }
 
+    /**
+     * 窗口剩余可补名额。调用方需持 task 锁。
+     *
+     * <p>显式配置了 maxInFlight：剩余名额 = maxInFlight - 在途数，随单台收敛即腾位随补；
+     * 未配置（默认语义）：必须整批收敛（在途归零）才放行下一批，批内只要有设备还在途，
+     * 剩余名额一律为 0——与旧版「一批收敛后再开下一批」的串行推进完全一致。</p>
+     */
+    int windowRemaining(RolloutTask task, int inFlight) {
+        if (!task.isMaxInFlightConfigured() && inFlight > 0) {
+            return 0;
+        }
+        return Math.max(0, task.getMaxInFlight() - inFlight);
+    }
+
     /** 关闭其中所有设备均已收敛（激活成功或已回滚）的打开批次。调用方需持 task 锁。 */
     void closeSettledBatches(RolloutTask task) {
         for (TaskBatch batch : task.getBatches().values()) {
@@ -267,9 +286,9 @@ public class RolloutService {
             view.put("success", success);
             view.put("rolledBack", failed);
             view.put("inProgress", inProgress);
-            // 并行窗口：当前在途设备数与剩余可补名额
+            // 并行窗口：当前在途设备数与剩余可补名额（默认语义下批未整批收敛时名额为 0）
             view.put("inFlight", inFlightNow);
-            view.put("windowRemaining", Math.max(0, task.getMaxInFlight() - inFlightNow));
+            view.put("windowRemaining", windowRemaining(task, inFlightNow));
             view.put("failureRate", failureRate);
             view.put("abortReason", task.getAbortReason());
             view.put("batches", batchViews);
